@@ -1,0 +1,7 @@
+geopandas
+numpy
+pandas
+rasterio
+scikit-learn
+scikit-image
+joblib
