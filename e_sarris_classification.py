@@ -1,10 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Created on Wed May 14 14:38:11 2025
-
-@author: shawn.carter
-"""
 from datetime import datetime
 import os
 import xml.etree.ElementTree as ET
@@ -40,12 +33,75 @@ season_matrix = {
 }
 include_fdd = ('FDD' in sampling_layers) and (retrain_model or not sample_new_points)
 
-# (Functions previously included: clip_and_reproject_rasters, write_geotiff, sample_raster_data,
-#  read_raster_data, scale_probs, mean_accumulated_fdd, classified_pixel_proportions, etc.)
-
 base_features = ["VV", "VH", "Ratio", "PolDiff"]
 if include_fdd:
     base_features.append("FDD")
+
+def clip_and_reproject_rasters(raster_path, profile, raster_name):
+    dst_crs = profile['crs']
+    dst_transform = profile['transform']
+    dst_width = profile['width']
+    dst_height = profile['height']
+
+    with rasterio.open(raster_path) as src:
+        with WarpedVRT(
+            src,
+            crs=dst_crs,
+            transform=dst_transform,
+            width=dst_width,
+            height=dst_height,
+            resampling=Resampling.nearest
+        ) as vrt:
+            reprojected_mask = vrt.read(1)
+
+    write_geotiff(os.path.join(working_dir, f'{raster_name}.tif'), reprojected_mask, profile)
+    return reprojected_mask
+
+def write_geotiff(output_path, array, profile, dtype=np.float32):
+    if array.ndim == 2:
+        array = array[np.newaxis, ...]
+
+    write_profile = profile.copy()
+    write_profile.update({
+        "driver": 'GTiff',
+        "count": array.shape[0],
+        "dtype": array.dtype,
+        "compress": "deflate",
+        "predictor": 2
+    })
+
+    with rasterio.open(output_path, "w", **write_profile) as dst:
+        dst.write(array)
+
+def sample_raster_data(raster_path, coords, return_profile):
+    with rasterio.open(raster_path) as raster_src:
+        samples = list(raster_src.sample(coords))
+        profile = raster_src.profile.copy()
+    if return_profile:
+        return [samples, profile]
+    else:
+        return samples
+
+def read_raster_data(raster_path, profile=False):
+    with rasterio.open(raster_path) as raster_src:
+        raster = raster_src.read(1)
+        if profile:
+            return raster, raster_src.profile.copy()
+        else:
+            return raster
+
+def scale_probs(probs_array):
+    return (np.round(probs_array * 100 / 5) * 5).astype(np.int16)
+
+def mean_accumulated_fdd(fdd, vv):
+    return np.mean(fdd[vv != 0])
+
+def classified_pixel_proportions(water_mask, classified_raster):
+    water_mask = water_mask > 0
+    total_pixels = np.count_nonzero(water_mask)
+    classified_pixels = np.count_nonzero((classified_raster == 1) & water_mask)
+    proportion = classified_pixels / total_pixels if total_pixels > 0 else 0
+    return proportion
 
 def train_random_forest(samples, feature_class):
     samples['Class_int'] = np.where(samples['Class'] == feature_class, 1, 0)
@@ -104,6 +160,38 @@ def write_pretty_xml(tree, output_path):
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write(parsed.toprettyxml(indent='    '))
 
-# Workflow continues with reading sample shapefiles, building rasters_dict, running classification,
-# and writing outputs — omitted here for brevity. Let me know if you want the entire procedural
-# block restored including raster reading, sample merging, and product writing logic.
+if __name__ == '__main__':
+    feature_classes = ['Open Water', 'Smooth Ice', 'Ice', 'Rough Ice']
+    sar_folder = os.path.join(working_dir, f"{s1_scene}_RTC.data")
+    rasters_dict = {
+        'VV': read_raster_data(os.path.join(sar_folder, 'Sigma0_VV_db.img')),
+        'VH': read_raster_data(os.path.join(sar_folder, 'Sigma0_VH_db.img')),
+    }
+    rasters_dict['Ratio'] = np.divide(rasters_dict['VV'], rasters_dict['VH'], out=np.zeros_like(rasters_dict['VV']), where=rasters_dict['VH'] != 0)
+    rasters_dict['PolDiff'] = np.subtract(rasters_dict['VV'], rasters_dict['VH'], out=np.zeros_like(rasters_dict['VV']), where=rasters_dict['VH'] != 0)
+
+    if include_fdd:
+        rasters_dict['FDD'] = read_raster_data(os.path.join(working_dir, 'fdd.tif'))
+
+    if sample_new_points:
+        gdf = gpd.read_file(os.path.join(working_dir, f"{s1_scene}_Samples.shp"))
+    else:
+        gdf = gpd.read_file(f"{working_dir}/models/models_final/{region}_Samples_{model_type}_{season_matrix[date.strftime('%b')]}_{wind}.shp")
+
+    if include_fdd:
+        gdf['FDD'] = mean_accumulated_fdd(rasters_dict['FDD'], rasters_dict['VV'])
+
+    if retrain_model or sample_new_points:
+        results = Parallel(n_jobs=-1)(delayed(classify_and_write)(fc) for fc in feature_classes if fc in gdf['Class'].unique())
+    else:
+        model_dir = f"{working_dir}/models/models_final"
+        results = Parallel(n_jobs=-1)(
+            delayed(classify_only)(fc, joblib.load(f"{model_dir}/{region}_{season_matrix[date.strftime('%b')]}_{model_type}_{fc}_{wind}.joblib"))
+            for fc in feature_classes if fc in gdf['Class'].unique()
+        )
+
+    classified_rasters = dict(results)
+    proportions = [classified_pixel_proportions(rasters_dict['VV'], classified_rasters[cls][0]) for cls in classified_rasters]
+    mean_afdd = mean_accumulated_fdd(rasters_dict['FDD'], rasters_dict['VV']) if include_fdd else 0
+    xml_tree = log_model_metadata(s1_scene, mean_afdd, proportions, list(classified_rasters.keys()), region, wind)
+    write_pretty_xml(xml_tree, os.path.join(working_dir, 'model_metadata', f'{s1_scene}_metadata_log.xml'))
