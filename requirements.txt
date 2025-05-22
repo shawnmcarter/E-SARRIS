@@ -5,3 +5,6 @@ rasterio
 scikit-learn
 scikit-image
 joblib
+
+
+The model requires a raster water mask supplied which contains values of [0,2] which correspond to 0 = Land, 1 = Rivers, 2 = Lakes
